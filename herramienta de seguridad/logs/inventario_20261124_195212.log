@@ -1,0 +1,21 @@
+2026-11-24T18:52:12Z INICIO: red=192.168.0.0/22 escaner=kali solo_inv=false
+2026-11-24T18:53:12Z OK: inventario /mnt/hgfs/Nextcloud/Personal/MASTER/herramienta de seguridad/inventarios/inv_20261124_195312.json - 28 hosts - 59s
+2026-11-24T18:53:12Z ALERTA: 28 dispositivos no autorizados
+2026-11-24T18:53:12Z CAMBIOS: 1 cambios detectados
+2026-11-24T18:53:12Z WEBHOOK: enviado (200)
+2026-11-24T18:55:36Z OK: inventario /mnt/hgfs/Nextcloud/Personal/MASTER/herramienta de seguridad/inventarios/inv_20261124_195536.json - 28 hosts - 23s
+2026-11-24T18:55:37Z ALERTA: 28 dispositivos no autorizados
+2026-11-24T18:55:37Z CAMBIOS: 1 cambios detectados
+2026-11-24T18:55:37Z WEBHOOK: enviado (200)
+2026-11-24T18:58:22Z OK: inventario /mnt/hgfs/Nextcloud/Personal/MASTER/herramienta de seguridad/inventarios/inv_20261124_195822.json - 28 hosts - 45s
+2026-11-24T18:58:22Z ALERTA: 28 dispositivos no autorizados
+2026-11-24T18:58:23Z CAMBIOS: 1 cambios detectados
+2026-11-24T18:58:23Z WEBHOOK: enviado (200)
+2026-11-24T19:00:51Z OK: inventario /mnt/hgfs/Nextcloud/Personal/MASTER/herramienta de seguridad/inventarios/inv_20261124_200051.json - 28 hosts - 28s
+2026-11-24T19:00:51Z ALERTA: 28 dispositivos no autorizados
+2026-11-24T19:00:51Z CAMBIOS: 1 cambios detectados
+2026-11-24T19:00:51Z WEBHOOK: enviado (200)
+2026-11-24T19:04:07Z OK: inventario /mnt/hgfs/Nextcloud/Personal/MASTER/herramienta de seguridad/inventarios/inv_20261124_200407.json - 28 hosts - 76s
+2026-11-24T19:04:07Z ALERTA: 28 dispositivos no autorizados
+2026-11-24T19:04:07Z CAMBIOS: 1 cambios detectados
+2026-11-24T19:04:07Z WEBHOOK: enviado (200)

@@ -1,0 +1,6 @@
+2026-11-24T18:47:59Z INICIO: red=192.168.0.0/22 escaner=kali solo_inv=false
+2026-11-24T18:48:36Z OK: inventario /mnt/hgfs/Nextcloud/Personal/MASTER/herramienta de seguridad/inventarios/inv_20261124_194836.json - 28 hosts - 35s
+2026-11-24T18:48:36Z CAMBIOS: 2 cambios detectados
+2026-11-24T18:48:36Z WEBHOOK: enviado (200)
+2026-11-24T18:51:08Z OK: inventario /mnt/hgfs/Nextcloud/Personal/MASTER/herramienta de seguridad/inventarios/inv_20261124_195108.json - 28 hosts - 32s
+2026-11-24T18:51:09Z CAMBIOS: 0 cambios detectados

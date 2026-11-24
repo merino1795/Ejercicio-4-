@@ -1,0 +1,7 @@
+# Secretos y configuración local de endpoints
+.env
+*.env.local
+
+# Ficheros generados en ejecución
+inventarios/inv_*.json
+informe.md

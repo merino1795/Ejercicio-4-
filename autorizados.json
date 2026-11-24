@@ -1,0 +1,7 @@
+{
+  "descripcion": "Equipos autorizados en la red del laboratorio - Grupo 7",
+  "autorizados": [
+    { "ip": "192.168.1.1", "nombre": "gateway-lab" },
+    { "ip": "192.168.1.143", "nombre": "kali-g7" }
+  ]
+}

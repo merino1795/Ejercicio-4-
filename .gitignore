@@ -5,3 +5,6 @@
 # Ficheros generados en ejecución
 inventarios/inv_*.json
 informe.md
+panel_inventario.html
+panel_inventario.html.tmp
+index.html

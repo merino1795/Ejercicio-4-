@@ -13,6 +13,7 @@
 ```text
 inventario-red/
 ├── inventario.sh       # Script principal de escaneo, comparación, alertas e informe
+├── panel.sh            # Panel en terminal + web HTML que lee /sync filtrando por red/escáner
 ├── autorizados.json    # Lista de IPs permitidas en la red del laboratorio
 ├── informe.md          # Informe legible en Markdown generado automáticamente con jq -r
 ├── inventarios/        # Histórico de inventarios JSON (inv_AAAAMMDD_HHMMSS.json)
@@ -33,8 +34,8 @@ sudo apt update && sudo apt install -y jq shellcheck curl nmap
 Dar permisos de ejecución y comprobar buenas prácticas con `shellcheck`:
 
 ```bash
-chmod +x inventario.sh
-shellcheck inventario.sh
+chmod +x inventario.sh panel.sh
+shellcheck inventario.sh panel.sh
 ```
 
 ---
@@ -110,6 +111,41 @@ El script ejecuta y muestra trazas paso a paso (`[PASO 1/6]` a `[PASO 6/6]`):
 
 # 6. Verificar los eventos recibidos en el servidor del profesor (GET)
 ./inventario.sh --ver-sync
+```
+
+### Panel de inventario en tiempo real (`panel.sh`)
+
+Consulta periódicamente `GET /sync`, **filtra exclusivamente los eventos del Ejercicio 4** (descartando los mensajes de `monitor`, `alertas` de recursos del Ejercicio 2 y mensajes de `prueba`), **distingue cada red por separado** según `(escáner, IP pública de origen, red CIDR)` —infiriendo automáticamente el CIDR si un equipo solo envió `cambios_red`— y muestra los dispositivos detectados, puertos abiertos, puertos de riesgo y últimos cambios.
+
+Además, si indicas una red CIDR (`./panel.sh 192.168.1.0/24` o `--escanear 192.168.1.0/24`), lanza `inventario.sh` periódicamente en segundo plano y muestra un **contador en tiempo real con barra de progreso** tanto en terminal como en el panel web HTML.
+
+| Opción | Descripción | Valor por defecto |
+| --- | --- | --- |
+| `[RED_CIDR]` / `-S, --escanear RED_CIDR` | Activa el escaneo automático periódico de esa red mediante `inventario.sh`. | Desactivado |
+| `--cada SEGUNDOS` | Intervalo entre escaneos automáticos (entero `>= 5`). | `60` |
+| `--nombre-escaner NOM` | Nombre de escáner a pasar a `inventario.sh` (`-e`). | `kali-g7` |
+| `--auditar-escaneo` | Pasa `--auditar` a `inventario.sh` en cada escaneo automático. | Desactivado |
+| `-i, --intervalo SEGUNDOS` | Intervalo de refresco de `/sync` (terminal y `<meta refresh>`). | `10` |
+| `-s, --sync URL` | URL `GET` del servidor `/sync`. | Endpoint `/sync` |
+| `-t, --timeout SEGUNDOS` | Timeout de descarga `curl` (`--compressed`). | `30` |
+| `-c, --canal NOMBRE` | Canal de inventario. | `inventario` |
+| `--solo-canal` | Muestra solo eventos con `"canal": "inventario"` explícito. | Desactivado |
+| `-r, --red FILTRO` | Filtra por red CIDR o subcadena (ej. `192.168.1.0/24`). | Todas |
+| `-e, --escaner FILTRO` | Filtra por nombre de escáner (ej. `kali-g7`). | Todos |
+| `--html [FICHERO]` | Genera panel web HTML con pestañas por red, buscador y contador en vivo. | `./panel_inventario.html` |
+| `--servir [PUERTO]` | Activa `--html` y levanta `python3 -m http.server` (se cierra con `Ctrl+C`). | `8081` |
+| `-1, --once` | Ejecutar una única consulta (y un escaneo si se indicó red) y salir. | Desactivado |
+| `--desde-archivo FILE` | Leer respuesta `/sync` desde un JSON local (pruebas offline). | — |
+
+```bash
+# Panel + escaneo automático de 192.168.1.0/24 cada 60s + web en http://localhost:8081/
+./panel.sh 192.168.1.0/24 --cada 60 --html --servir 8081
+
+# Solo panel en terminal (sin lanzar escaneos locales, leyendo todas las redes de /sync)
+./panel.sh
+
+# Consultar una sola vez filtrando por red y escáner
+./panel.sh -r 192.168.1.0/24 -e kali-g7 --once
 ```
 
 ---

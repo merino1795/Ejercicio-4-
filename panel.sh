@@ -12,11 +12,12 @@
 #              equipos no autorizados y últimos cambios recibidos del webhook.
 #
 # Uso:
-#   ./panel.sh [opciones]
+#   ./panel.sh [red_cidr] [opciones]
 #
 # Ejemplos:
 #   ./panel.sh
-#   ./panel.sh --html --servir 8081
+#   ./panel.sh 192.168.1.0/24 --cada 60 --html --servir 8081
+#   ./panel.sh --escanear 192.168.1.0/24 --cada 120 --html --servir 8081
 #   ./panel.sh -r 192.168.1.0/24 --once
 #   ./panel.sh --once --html --desde-archivo muestra_sync.json
 # ==============================================================================
@@ -61,6 +62,23 @@ SOLO_UNA_VEZ=false
 DESDE_ARCHIVO=""
 HTTP_PID=""
 
+# Opciones y estado de escaneo periódico integrado
+ESCANEAR_RED=""
+INTERVALO_ESCANEO=60
+AUDITAR_ESCANEO=false
+NOMBRE_ESCANER=""
+SCAN_PID=""
+SCAN_LOG=""
+SCAN_ESTADO="INACTIVO"
+SCAN_INICIO_EPOCH=0
+PROXIMO_ESCANEO_EPOCH=0
+PROXIMO_REFRESH_EPOCH=0
+ULTIMO_ESCANEO_TS="-"
+ULTIMO_ESCANEO_RESUMEN="Sin ejecutar aún"
+ESCANEO_CONTADOR=0
+ULTIMO_DATA_JSON=""
+ULTIMA_HORA_ACTUAL=""
+
 # Códigos ANSI (solo si la salida es terminal o forzado)
 if [[ -t 1 ]]; then
   C_RESET=$'\033[0m'
@@ -87,27 +105,67 @@ fi
 mostrar_uso() {
   cat <<EOF
 Uso:
-  $(basename "$0") [opciones]
+  $(basename "$0") [red_cidr] [opciones]
 
-Opciones:
-  -i, --intervalo SEGUNDOS    Intervalo de refresco en segundos (defecto: $INTERVALO)
+Opciones de escaneo periódico integrado:
+  -S, --escanear RED_CIDR     Lanza inventario.sh periódicamente sobre esa red (también puedes
+                              indicar el CIDR directamente como argumento posicional)
+      --cada SEGUNDOS         Intervalo entre escaneos automáticos en segundos (defecto: $INTERVALO_ESCANEO)
+      --nombre-escaner NOM    Nombre de escáner a pasar a inventario.sh (-e)
+      --auditar-escaneo       Pasa --auditar a inventario.sh en cada escaneo automático
+
+Opciones de consulta y visualización:
+  -i, --intervalo SEGUNDOS    Intervalo de refresco de /sync en segundos (defecto: $INTERVALO)
   -s, --sync URL              URL GET del servidor /sync (defecto: $SYNC_URL)
   -t, --timeout SEGUNDOS      Timeout de descarga curl en segundos (defecto: $TIMEOUT_CURL)
   -c, --canal NOMBRE          Nombre del canal de inventario (defecto: $CANAL)
       --solo-canal            Mostrar solo mensajes que incluyan explícitamente canal="$CANAL"
                               (por defecto acepta también eventos de inventario sin campo "canal"
                                descartando siempre "monitor", "alertas" de recursos y "prueba")
-  -r, --red FILTRO            Filtrar por red CIDR o subcadena (ej. 192.168.1.0/24)
-  -e, --escaner FILTRO        Filtrar por nombre de escáner (ej. kali-g7)
-      --html [FICHERO]        Generar panel web HTML con autorrecarga (defecto: $HTML_FILE)
+  -r, --red FILTRO            Filtrar vista por red CIDR o subcadena (ej. 192.168.1.0/24)
+  -e, --escaner FILTRO        Filtrar vista por nombre de escáner (ej. kali-g7)
+      --html [FICHERO]        Generar panel web HTML con autorrecarga y contador (defecto: $HTML_FILE)
       --servir [PUERTO]       Activa --html y sirve el panel web con python3 (defecto: $PUERTO_HTTP)
-  -1, --once                  Ejecutar una única actualización y salir
+  -1, --once                  Ejecutar una única actualización (y un escaneo si se indicó red) y salir
       --desde-archivo FILE    Leer respuesta /sync desde un fichero JSON local (pruebas offline)
   -h, --help                  Mostrar esta ayuda
 
 Variables de entorno opcionales (o .env):
   SYNC_URL, CANAL, PUERTOS_RIESGO, HTML_FILE
 EOF
+}
+
+validar_cidr_escaneo() {
+  local cidr="$1"
+  local octeto='(25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])'
+  local prefijo='(3[0-2]|[12]?[0-9])'
+  local regex="^${octeto}\.${octeto}\.${octeto}\.${octeto}/${prefijo}$"
+  if [[ ! "$cidr" =~ $regex ]]; then
+    echo "[ERROR] Red CIDR no válida para --escanear: '$cidr' (ejemplo: 192.168.1.0/24)" >&2
+    exit 1
+  fi
+}
+
+formatear_mmss() {
+  local seg="$1"
+  (( seg < 0 )) && seg=0
+  printf '%02d:%02d' $(( seg / 60 )) $(( seg % 60 ))
+}
+
+dibujar_barra_progreso() {
+  local restante="$1"
+  local total="$2"
+  local ancho="${3:-16}"
+  (( total < 1 )) && total=1
+  local transcurrido=$(( total - restante ))
+  (( transcurrido < 0 )) && transcurrido=0
+  (( transcurrido > total )) && transcurrido=$total
+  local llenos=$(( transcurrido * ancho / total ))
+  local vacios=$(( ancho - llenos ))
+  local barra="" i
+  for (( i = 0; i < llenos; i++ )); do barra+="#"; done
+  for (( i = 0; i < vacios; i++ )); do barra+="-"; done
+  printf '[%s]' "$barra"
 }
 
 comprobar_dependencias() {
@@ -123,9 +181,154 @@ comprobar_dependencias() {
     faltan+=("python3")
   fi
 
+  if [[ -n "$ESCANEAR_RED" ]]; then
+    if ! command -v nmap >/dev/null 2>&1; then
+      faltan+=("nmap")
+    fi
+    if [[ ! -x "$SCRIPT_DIR/inventario.sh" ]]; then
+      echo "[ERROR] No se encontró ejecutable $SCRIPT_DIR/inventario.sh para --escanear." >&2
+      exit 1
+    fi
+  fi
+
   if (( ${#faltan[@]} > 0 )); then
     echo "[ERROR] Faltan dependencias: ${faltan[*]}" >&2
     exit 1
+  fi
+}
+
+resumir_log_escaneo() {
+  local logf="$1"
+  local rc="$2"
+  if (( rc != 0 )); then
+    local err
+    err="$(grep -m1 '^\[ERROR\]' "$logf" 2>/dev/null | sed 's/^\[ERROR\] //' || true)"
+    printf '%s' "${err:-Fallo al ejecutar inventario.sh (código $rc)}"
+    return
+  fi
+
+  local info_inv cambio_txt
+  info_inv="$(grep -oE '\([0-9]+ equipo\(s\), [0-9]+ puerto\(s\) abierto\(s\)\)' "$logf" 2>/dev/null | tail -n1 || true)"
+  if grep -q '^Sin cambios$' "$logf" 2>/dev/null; then
+    cambio_txt="Sin cambios"
+  elif grep -q '^\[INFO\] Cambios detectados' "$logf" 2>/dev/null; then
+    cambio_txt="Cambios enviados al webhook"
+  elif grep -q '^\[INFO\] Primer inventario guardado' "$logf" 2>/dev/null; then
+    cambio_txt="Línea base enviada"
+  else
+    cambio_txt="OK"
+  fi
+
+  if [[ -n "$info_inv" ]]; then
+    printf '%s · %s' "${info_inv//[()]/}" "$cambio_txt"
+  else
+    printf '%s' "$cambio_txt"
+  fi
+}
+
+iniciar_escaneo_bg() {
+  [[ -z "$ESCANEAR_RED" ]] && return 0
+  if [[ -z "$SCAN_LOG" ]]; then
+    SCAN_LOG="$(mktemp /tmp/panel_inv_scan_XXXXXX.log)"
+  fi
+
+  local args=("$ESCANEAR_RED" --enviar-inventario)
+  if [[ "$AUDITAR_ESCANEO" == true ]]; then
+    args+=(--auditar)
+  fi
+  if [[ -n "$NOMBRE_ESCANER" ]]; then
+    args+=(-e "$NOMBRE_ESCANER")
+  fi
+
+  SCAN_ESTADO="ESCANEANDO"
+  SCAN_INICIO_EPOCH="$(date +%s)"
+  "$SCRIPT_DIR/inventario.sh" "${args[@]}" >"$SCAN_LOG" 2>&1 &
+  SCAN_PID=$!
+}
+
+ejecutar_escaneo_sincrono() {
+  [[ -z "$ESCANEAR_RED" ]] && return 0
+  if [[ -z "$SCAN_LOG" ]]; then
+    SCAN_LOG="$(mktemp /tmp/panel_inv_scan_XXXXXX.log)"
+  fi
+
+  local args=("$ESCANEAR_RED" --enviar-inventario)
+  if [[ "$AUDITAR_ESCANEO" == true ]]; then
+    args+=(--auditar)
+  fi
+  if [[ -n "$NOMBRE_ESCANER" ]]; then
+    args+=(-e "$NOMBRE_ESCANER")
+  fi
+
+  SCAN_ESTADO="ESCANEANDO"
+  SCAN_INICIO_EPOCH="$(date +%s)"
+  echo "[INFO] Ejecutando escaneo inicial sobre $ESCANEAR_RED..."
+  local rc=0
+  "$SCRIPT_DIR/inventario.sh" "${args[@]}" >"$SCAN_LOG" 2>&1 || rc=$?
+  ESCANEO_CONTADOR=$((ESCANEO_CONTADOR + 1))
+  ULTIMO_ESCANEO_TS="$(date -u +"%H:%M:%SZ")"
+  ULTIMO_ESCANEO_RESUMEN="$(resumir_log_escaneo "$SCAN_LOG" "$rc")"
+  if (( rc == 0 )); then
+    SCAN_ESTADO="ESPERANDO"
+  else
+    SCAN_ESTADO="ERROR"
+  fi
+  PROXIMO_ESCANEO_EPOCH=$(( $(date +%s) + INTERVALO_ESCANEO ))
+}
+
+comprobar_escaneo_bg() {
+  [[ -z "$SCAN_PID" ]] && return 1
+  if kill -0 "$SCAN_PID" 2>/dev/null; then
+    return 1
+  fi
+
+  local rc=0
+  wait "$SCAN_PID" || rc=$?
+  SCAN_PID=""
+  ESCANEO_CONTADOR=$((ESCANEO_CONTADOR + 1))
+  ULTIMO_ESCANEO_TS="$(date -u +"%H:%M:%SZ")"
+  ULTIMO_ESCANEO_RESUMEN="$(resumir_log_escaneo "$SCAN_LOG" "$rc")"
+  if (( rc == 0 )); then
+    SCAN_ESTADO="ESPERANDO"
+  else
+    SCAN_ESTADO="ERROR"
+  fi
+  PROXIMO_ESCANEO_EPOCH=$(( $(date +%s) + INTERVALO_ESCANEO ))
+  return 0
+}
+
+imprimir_linea_contador() {
+  local tick="${1:-0}"
+  [[ -t 1 ]] || return 0
+
+  local ahora rest_ref rest_scan
+  ahora="$(date +%s)"
+  rest_ref=$(( PROXIMO_REFRESH_EPOCH - ahora ))
+  (( rest_ref < 0 )) && rest_ref=0
+
+  local frames=("|" "/" "-" "\\")
+  local sp="${frames[$(( tick % 4 ))]}"
+
+  if [[ -n "$ESCANEAR_RED" ]]; then
+    if [[ "$SCAN_ESTADO" == "ESCANEANDO" ]]; then
+      local trans=$(( ahora - SCAN_INICIO_EPOCH ))
+      (( trans < 0 )) && trans=0
+      printf '\r\033[K %s[%s] ESCANEANDO %s%s (lleva %s)  |  Refresco /sync en: %02ds  |  Escaneos: %d  |  Ctrl+C salir' \
+        "$C_AMARILLO" "$sp" "$ESCANEAR_RED" "$C_RESET" \
+        "$(formatear_mmss "$trans")" "$rest_ref" "$ESCANEO_CONTADOR"
+    else
+      rest_scan=$(( PROXIMO_ESCANEO_EPOCH - ahora ))
+      (( rest_scan < 0 )) && rest_scan=0
+      local barra
+      barra="$(dibujar_barra_progreso "$rest_scan" "$INTERVALO_ESCANEO" 16)"
+      printf '\r\033[K %s[AUTO]%s Próximo escaneo (%s) en: %s%s%s %s  |  Refresco /sync en: %02ds  |  Escaneos: %d  |  Ctrl+C salir' \
+        "$C_CIAN_BOLD" "$C_RESET" "$ESCANEAR_RED" \
+        "$C_VERDE" "$(formatear_mmss "$rest_scan")" "$C_RESET" "$barra" \
+        "$rest_ref" "$ESCANEO_CONTADOR"
+    fi
+  else
+    printf '\r\033[K %s[SYNC]%s Próximo refresco de /sync en: %s%02ds%s  |  Ctrl+C para salir' \
+      "$C_CIAN" "$C_RESET" "$C_BOLD" "$rest_ref" "$C_RESET"
   fi
 }
 
@@ -507,6 +710,25 @@ dibujar_panel_terminal() {
     "$C_BOLD" "$total_puertos" "$C_RESET" \
     "$(if (( total_riesgo > 0 )); then printf '%s' "$C_ROJO_BOLD"; else printf '%s' "$C_VERDE"; fi)" "$total_riesgo" "$C_RESET" \
     "$(if (( total_noauth > 0 )); then printf '%s' "$C_AMARILLO"; else printf '%s' "$C_VERDE"; fi)" "$total_noauth" "$C_RESET"
+  if [[ -n "$ESCANEAR_RED" ]]; then
+    local est_c="$C_VERDE"
+    local est_info=""
+    local ahora_ban
+    ahora_ban="$(date +%s)"
+    if [[ "$SCAN_ESTADO" == "ESCANEANDO" ]]; then
+      est_c="$C_AMARILLO"
+      est_info="ESCANEANDO (lleva $(formatear_mmss $(( ahora_ban - SCAN_INICIO_EPOCH ))))"
+    elif [[ "$SCAN_ESTADO" == "ERROR" ]]; then
+      est_c="$C_ROJO_BOLD"
+      est_info="ERROR — próximo en $(formatear_mmss $(( PROXIMO_ESCANEO_EPOCH - ahora_ban )))"
+    else
+      est_info="ESPERANDO — próximo en $(formatear_mmss $(( PROXIMO_ESCANEO_EPOCH - ahora_ban )))"
+    fi
+    printf ' Escaneo auto: %s%s%s cada %ss | Estado: %s%s%s | Completados: %s | Último (%s): %s\n' \
+      "$C_MAGENTA" "$ESCANEAR_RED" "$C_RESET" "$INTERVALO_ESCANEO" \
+      "$est_c" "$est_info" "$C_RESET" \
+      "$ESCANEO_CONTADOR" "$ULTIMO_ESCANEO_TS" "$ULTIMO_ESCANEO_RESUMEN"
+  fi
   printf '%s======================================================================================================================%s\n' "$C_CIAN" "$C_RESET"
 
   if (( total_redes == 0 )); then
@@ -721,6 +943,36 @@ generar_panel_html() {
     end
   ' <<< "$data_json")"
 
+  local scan_banner_html=""
+  if [[ -n "$ESCANEAR_RED" ]]; then
+    local esc_red_h esc_res_h esc_ts_h
+    esc_red_h="$(jq -Rr '@html' <<< "$ESCANEAR_RED")"
+    esc_res_h="$(jq -Rr '@html' <<< "$ULTIMO_ESCANEO_RESUMEN")"
+    esc_ts_h="$(jq -Rr '@html' <<< "$ULTIMO_ESCANEO_TS")"
+    scan_banner_html="<section class=\"scan-bar scan-${SCAN_ESTADO,,}\" id=\"scanBar\" data-state=\"${SCAN_ESTADO}\" data-next-scan=\"${PROXIMO_ESCANEO_EPOCH}\" data-scan-start=\"${SCAN_INICIO_EPOCH}\" data-scan-interval=\"${INTERVALO_ESCANEO}\">
+      <div class=\"scan-left\">
+        <span class=\"scan-dot\"></span>
+        <div>
+          <div class=\"scan-title\">Escaneo automático: <code>${esc_red_h}</code> cada <strong>${INTERVALO_ESCANEO}s</strong> · <span id=\"scanStateLabel\">${SCAN_ESTADO}</span></div>
+          <div class=\"scan-sub\">Completados: <strong>${ESCANEO_CONTADOR}</strong> · Último (${esc_ts_h}): ${esc_res_h}</div>
+        </div>
+      </div>
+      <div class=\"scan-right\">
+        <div class=\"scan-timer-wrap\">
+          <span class=\"scan-timer-lbl\" id=\"scanTimerLbl\">Próximo escaneo</span>
+          <strong class=\"scan-timer\" id=\"scanTimer\">--:--</strong>
+        </div>
+        <div class=\"scan-progress\"><div class=\"scan-progress-fill\" id=\"scanProgressFill\"></div></div>
+      </div>
+    </section>"
+  fi
+
+  local next_refresh_epoch
+  next_refresh_epoch="$PROXIMO_REFRESH_EPOCH"
+  if (( next_refresh_epoch <= 0 )); then
+    next_refresh_epoch=$(( $(date +%s) + INTERVALO ))
+  fi
+
   local tmp_html="${HTML_FILE}.tmp"
   cat <<EOF > "$tmp_html"
 <!DOCTYPE html>
@@ -869,6 +1121,28 @@ generar_panel_html() {
     .port-risk { background: rgba(239, 68, 68, 0.20); color: #fecaca; border: 1px solid rgba(239, 68, 68, 0.55); font-weight: 700; }
     .empty-box, .empty-row { text-align: center; padding: 28px; color: var(--muted); }
     .hidden { display: none !important; }
+    .scan-bar {
+      display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 16px;
+      background: var(--surface); border: 1px solid rgba(56, 189, 248, 0.35);
+      border-radius: 14px; padding: 14px 18px; margin-bottom: 18px; backdrop-filter: blur(10px);
+    }
+    .scan-bar.scan-escaneando { border-color: rgba(234, 179, 8, 0.55); background: rgba(234, 179, 8, 0.08); }
+    .scan-bar.scan-error { border-color: rgba(239, 68, 68, 0.55); background: rgba(239, 68, 68, 0.08); }
+    .scan-left { display: flex; align-items: center; gap: 12px; }
+    .scan-dot { width: 12px; height: 12px; border-radius: 50%; background: var(--ok); box-shadow: 0 0 10px var(--ok); flex-shrink: 0; }
+    .scan-bar.scan-escaneando .scan-dot { background: var(--warn); box-shadow: 0 0 12px var(--warn); animation: pulseDot 1s ease-in-out infinite; }
+    .scan-bar.scan-error .scan-dot { background: var(--crit); box-shadow: 0 0 10px var(--crit); }
+    @keyframes pulseDot { 0%, 100% { transform: scale(1); opacity: 1; } 50% { transform: scale(1.35); opacity: 0.55; } }
+    .scan-title { font-size: 0.92rem; font-weight: 700; }
+    .scan-sub { font-size: 0.8rem; color: var(--muted); margin-top: 3px; }
+    .scan-right { display: flex; flex-direction: column; align-items: flex-end; gap: 6px; min-width: 210px; }
+    .scan-timer-wrap { display: flex; align-items: baseline; gap: 10px; }
+    .scan-timer-lbl { font-size: 0.74rem; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); }
+    .scan-timer { font-family: ui-monospace, monospace; font-size: 1.45rem; font-weight: 800; color: var(--cyan); }
+    .scan-bar.scan-escaneando .scan-timer { color: #fde047; }
+    .scan-progress { width: 210px; height: 7px; background: rgba(148, 163, 184, 0.18); border-radius: 999px; overflow: hidden; }
+    .scan-progress-fill { height: 100%; width: 0%; background: linear-gradient(90deg, var(--cyan), var(--violet)); transition: width 0.4s linear; }
+    .scan-bar.scan-escaneando .scan-progress-fill { width: 100% !important; background: linear-gradient(90deg, var(--warn), #f97316); animation: pulseDot 1.2s ease-in-out infinite; }
   </style>
 </head>
 <body>
@@ -877,7 +1151,7 @@ generar_panel_html() {
       <div>
         <h1>Panel de Inventario de Red — Ejercicio 4</h1>
         <div class="meta">
-          <span>Actualizado: <strong>${hora_actual} UTC</strong> (refresco cada ${INTERVALO}s)</span>
+          <span>Actualizado: <strong>${hora_actual} UTC</strong> · Próximo refresco en <strong id="syncCountdown" data-next-refresh="${next_refresh_epoch}">${INTERVALO}s</strong></span>
           <span>Origen: <code>${SYNC_URL}</code></span>
         </div>
       </div>
@@ -885,6 +1159,8 @@ generar_panel_html() {
         Filtro webhook activo: <strong>${kpi_ej4}</strong> eventos Ej.4 · <strong>${kpi_desc}</strong> descartados (Ej.2 / pruebas) de ${kpi_total} totales
       </div>
     </header>
+
+    ${scan_banner_html}
 
     <section class="kpis">
       <div class="kpi cyan"><span>Redes / Escáneres</span><strong>${kpi_redes}</strong></div>
@@ -933,6 +1209,51 @@ generar_panel_html() {
           });
         });
       }
+
+      function fmtMMSS(sec) {
+        const s = Math.max(0, Math.floor(sec));
+        const m = String(Math.floor(s / 60)).padStart(2, '0');
+        const r = String(s % 60).padStart(2, '0');
+        return m + ':' + r;
+      }
+
+      const syncEl = document.getElementById('syncCountdown');
+      const scanBar = document.getElementById('scanBar');
+      const scanTimer = document.getElementById('scanTimer');
+      const scanTimerLbl = document.getElementById('scanTimerLbl');
+      const scanFill = document.getElementById('scanProgressFill');
+
+      function tickTimers() {
+        const now = Math.floor(Date.now() / 1000);
+        if (syncEl) {
+          const nextRef = parseInt(syncEl.dataset.nextRefresh || '0', 10);
+          if (nextRef > 0) {
+            const rem = Math.max(0, nextRef - now);
+            syncEl.textContent = rem + 's';
+          }
+        }
+        if (scanBar && scanTimer) {
+          const state = scanBar.dataset.state || '';
+          const interval = Math.max(1, parseInt(scanBar.dataset.scanInterval || '60', 10));
+          if (state === 'ESCANEANDO') {
+            const start = parseInt(scanBar.dataset.scanStart || String(now), 10);
+            if (scanTimerLbl) scanTimerLbl.textContent = 'Escaneando (tiempo)';
+            scanTimer.textContent = fmtMMSS(now - start);
+          } else {
+            const nextScan = parseInt(scanBar.dataset.nextScan || '0', 10);
+            const rem = Math.max(0, nextScan - now);
+            if (scanTimerLbl) scanTimerLbl.textContent = 'Próximo escaneo';
+            scanTimer.textContent = fmtMMSS(rem);
+            if (scanFill) {
+              const pct = Math.min(100, Math.max(0, ((interval - rem) / interval) * 100));
+              scanFill.style.width = pct.toFixed(1) + '%';
+            }
+          }
+        }
+      }
+
+      tickTimers();
+      setInterval(tickTimers, 1000);
     })();
   </script>
 </body>
@@ -945,6 +1266,7 @@ EOF
 ejecutar_ciclo() {
   local raw_json hora_actual data_json
   hora_actual="$(date -u +"%H:%M:%S")"
+  PROXIMO_REFRESH_EPOCH=$(( $(date +%s) + INTERVALO ))
 
   if [[ -n "$DESDE_ARCHIVO" ]]; then
     if [[ ! -f "$DESDE_ARCHIVO" ]]; then
@@ -965,6 +1287,8 @@ ejecutar_ciclo() {
   fi
 
   data_json="$(procesar_sync_json "$raw_json")"
+  ULTIMO_DATA_JSON="$data_json"
+  ULTIMA_HORA_ACTUAL="$hora_actual"
   dibujar_panel_terminal "$data_json" "$hora_actual"
 
   if [[ "$MODO_HTML" == true ]]; then
@@ -972,10 +1296,23 @@ ejecutar_ciclo() {
   fi
 }
 
+refrescar_html_estado() {
+  if [[ "$MODO_HTML" == true && -n "$ULTIMO_DATA_JSON" ]]; then
+    generar_panel_html "$ULTIMO_DATA_JSON" "${ULTIMA_HORA_ACTUAL:-$(date -u +"%H:%M:%S")}"
+  fi
+}
+
 limpiar_al_salir() {
+  if [[ -n "$SCAN_PID" ]]; then
+    kill "$SCAN_PID" 2>/dev/null || true
+    wait "$SCAN_PID" 2>/dev/null || true
+  fi
   if [[ -n "$HTTP_PID" ]]; then
     kill "$HTTP_PID" 2>/dev/null || true
     wait "$HTTP_PID" 2>/dev/null || true
+  fi
+  if [[ -n "$SCAN_LOG" && -f "$SCAN_LOG" ]]; then
+    rm -f "$SCAN_LOG"
   fi
   printf '\n[INFO] Panel de inventario detenido.\n'
   exit 0
@@ -984,6 +1321,25 @@ limpiar_al_salir() {
 parsear_argumentos() {
   while (( $# > 0 )); do
     case "$1" in
+      -S|--escanear)
+        [[ $# -lt 2 ]] && { echo "[ERROR] Falta valor para $1" >&2; exit 1; }
+        ESCANEAR_RED="$2"
+        shift 2
+        ;;
+      --cada)
+        [[ $# -lt 2 ]] && { echo "[ERROR] Falta valor para $1" >&2; exit 1; }
+        INTERVALO_ESCANEO="$2"
+        shift 2
+        ;;
+      --nombre-escaner)
+        [[ $# -lt 2 ]] && { echo "[ERROR] Falta valor para $1" >&2; exit 1; }
+        NOMBRE_ESCANER="$2"
+        shift 2
+        ;;
+      --auditar-escaneo)
+        AUDITAR_ESCANEO=true
+        shift
+        ;;
       -i|--intervalo)
         [[ $# -lt 2 ]] && { echo "[ERROR] Falta valor para $1" >&2; exit 1; }
         INTERVALO="$2"
@@ -1050,10 +1406,20 @@ parsear_argumentos() {
         mostrar_uso
         exit 0
         ;;
-      *)
+      -*)
         echo "[ERROR] Opción desconocida: $1" >&2
         mostrar_uso >&2
         exit 1
+        ;;
+      *)
+        if [[ -z "$ESCANEAR_RED" ]]; then
+          ESCANEAR_RED="$1"
+          shift
+        else
+          echo "[ERROR] Argumento inesperado: $1" >&2
+          mostrar_uso >&2
+          exit 1
+        fi
         ;;
     esac
   done
@@ -1061,10 +1427,16 @@ parsear_argumentos() {
 
 main() {
   parsear_argumentos "$@"
-  comprobar_dependencias
 
+  if [[ -n "$ESCANEAR_RED" ]]; then
+    validar_cidr_escaneo "$ESCANEAR_RED"
+  fi
   if ! [[ "$INTERVALO" =~ ^[0-9]+$ ]] || (( INTERVALO < 1 )); then
-    echo "[ERROR] El intervalo debe ser un entero >= 1." >&2
+    echo "[ERROR] El intervalo de refresco debe ser un entero >= 1." >&2
+    exit 1
+  fi
+  if ! [[ "$INTERVALO_ESCANEO" =~ ^[0-9]+$ ]] || (( INTERVALO_ESCANEO < 5 )); then
+    echo "[ERROR] El intervalo de escaneo (--cada) debe ser un entero >= 5." >&2
     exit 1
   fi
   if ! [[ "$TIMEOUT_CURL" =~ ^[0-9]+$ ]] || (( TIMEOUT_CURL < 1 )); then
@@ -1072,8 +1444,16 @@ main() {
     exit 1
   fi
 
+  comprobar_dependencias
+
   if [[ "$SOLO_UNA_VEZ" == true ]]; then
+    if [[ -n "$ESCANEAR_RED" ]]; then
+      ejecutar_escaneo_sincrono
+    fi
     ejecutar_ciclo
+    if [[ -n "$SCAN_LOG" && -f "$SCAN_LOG" ]]; then
+      rm -f "$SCAN_LOG"
+    fi
     exit 0
   fi
 
@@ -1084,7 +1464,6 @@ main() {
     html_dir="$(dirname "$HTML_FILE")"
     html_base="$(basename "$HTML_FILE")"
     mkdir -p "$html_dir"
-    # Crear index.html enlazado si el fichero HTML tiene otro nombre
     if [[ "$html_base" != "index.html" && ! -e "$html_dir/index.html" ]]; then
       ln -sf "$html_base" "$html_dir/index.html"
     fi
@@ -1093,9 +1472,38 @@ main() {
     echo "[INFO] Servidor web iniciado en http://0.0.0.0:${PUERTO_HTTP}/${html_base} (PID $HTTP_PID)"
   fi
 
+  # Si el usuario activó escaneo periódico, lanzar el primer escaneo inmediatamente en segundo plano
+  if [[ -n "$ESCANEAR_RED" ]]; then
+    iniciar_escaneo_bg
+  fi
+
+  ejecutar_ciclo || true
+
+  local tick=0 ahora
   while true; do
-    ejecutar_ciclo || true
-    sleep "$INTERVALO"
+    sleep 1
+    tick=$((tick + 1))
+    ahora="$(date +%s)"
+
+    # 1. Comprobar si el escaneo en segundo plano acaba de terminar
+    if comprobar_escaneo_bg; then
+      ejecutar_ciclo || true
+      imprimir_linea_contador "$tick"
+      continue
+    fi
+
+    # 2. Comprobar si toca iniciar un nuevo escaneo automático
+    if [[ -n "$ESCANEAR_RED" && -z "$SCAN_PID" && "$ahora" -ge "$PROXIMO_ESCANEO_EPOCH" ]]; then
+      iniciar_escaneo_bg
+      refrescar_html_estado
+    fi
+
+    # 3. Comprobar si toca refrescar /sync
+    if (( ahora >= PROXIMO_REFRESH_EPOCH )); then
+      ejecutar_ciclo || true
+    fi
+
+    imprimir_linea_contador "$tick"
   done
 }
 

@@ -22,38 +22,81 @@ Uso: $0 <CIDR> [opciones]
 Opciones:
   -e <escaner>        Nombre del escáner (default: hostname)
   -w <url-webhook>    URL del webhook
-  -v <segundos>       Modo vigilancia: repetir cada N segundos (default: 120)
+  -v <segundos>       Modo vigilancia: repetir cada N segundos (default: 300)
   -i                  Solo inventario (no vigila)
   -r                  Generar informe (informe.md)
+  -c <archivo>        Fichero de configuración (default: inventario.conf)
   -h                  Ayuda
 
 Ejemplos:
   $0 192.168.0.0/22
   $0 192.168.0.0/22 -v 60 -r
   $0 192.168.0.0/22 -e kali-g4 -i
+  $0 192.168.0.0/22 -c mi_config.conf
 EOF
 }
 
-# ── Argumentos ────────────────────────────────────────────────────────────────
+# ── Defaults ─────────────────────────────────────────────────────────────────
 ESCANER="$(hostname 2>/dev/null || echo desconocido)"
 WEBHOOK="http://62.238.114.81:9007/webhook/0WzszSAemPOL"
 SYNC_URL="http://62.238.114.81:8087/sync"
-VIGILANCIA=120
+VIGILANCIA=300
 SOLO_INV=false
 GENERAR_INFORME=false
+SYNC_FALLOS=0
+SYNC_MAX_FALLOS=5
+SYNC_ACTIVADO=true
+WEBHOOK_FALLOS=0
+WEBHOOK_MAX_FALLOS=5
+WEBHOOK_ACTIVADO=true
 
-while getopts ':e:w:vihr' opt; do
+# Puertos a escanear (todos los puertos)
+PUERTOS_SCAN="1-65535"
+RETRY_NMAP=3
+RETRY_BACKOFF=(5 15)  # esperas entre reintentos: 5s, 15s
+
+# ── Argumentos ───────────────────────────────────────────────────────────────
+CONFIG_FILE=""
+
+while getopts ':e:w:v:ic:rh' opt; do
   case "$opt" in
     e) ESCANER="$OPTARG" ;;
     w) WEBHOOK="$OPTARG" ;;
     v) VIGILANCIA="$OPTARG" ;;
     i) SOLO_INV=true ;;
     r) GENERAR_INFORME=true ;;
+    c) CONFIG_FILE="$OPTARG" ;;
     h) uso; exit 0 ;;
     \?) echo "${ROJO}[ERROR]${RESET} Opción desconocida: -$OPTARG" >&2; exit 1 ;;
   esac
 done
 shift $((OPTIND - 1))
+
+# ── Config file ─────────────────────────────────────────────────────────────
+if [[ -z "$CONFIG_FILE" ]]; then
+  CONFIG_FILE="$(pwd)/inventario.conf"
+fi
+if [[ -f "$CONFIG_FILE" ]]; then
+  # shellcheck disable=SC1090
+  source "$CONFIG_FILE"
+  echo "${AZUL}[*]${RESET} Config: $CONFIG_FILE"
+else
+  # Crear plantilla si no existe
+  if [[ ! -f "$CONFIG_FILE" ]]; then
+    cat > "$CONFIG_FILE" <<CONFEOF
+# Inventario de red — configuración
+# Sobrescribe los valores por defecto del script
+
+WEBHOOK="http://62.238.114.81:9007/webhook/0WzszSAemPOL"
+SYNC_URL="http://62.238.114.81:8087/sync"
+VIGILANCIA=300
+ESCANER="$(hostname 2>/dev/null || echo desconocido)"
+PUERTOS_SCAN="1-65535"
+RETRY_NMAP=3
+CONFEOF
+    echo "${AMARILLO}[*]${RESET} Config creada: $CONFIG_FILE"
+  fi
+fi
 
 if [[ $# -lt 1 ]]; then
   uso
@@ -111,25 +154,43 @@ log() {
   echo "$(date -u '+%Y-%m-%dT%H:%M:%SZ') $msg" >> "$LOG_FILE"
 }
 
+# ── Función: nmap con retry ────────────────────────────────────────────────
+nmap_retry() {
+  local xml_tmp="$1"
+  local attempt=1
+  local total_attempts=$(( RETRY_NMAP + 1 ))
+
+  while (( attempt <= total_attempts )); do
+    local exit_code=0
+    nmap -T4 --max-rtt-timeout 3 -p "$PUERTOS_SCAN" --open -oX "$xml_tmp" "$RED" 2>/dev/null || exit_code=$?
+
+    if (( exit_code == 0 )) && [[ -s "$xml_tmp" ]]; then
+      return 0
+    fi
+
+    if (( attempt < total_attempts )); then
+      local backoff="${RETRY_BACKOFF[$(( attempt - 1 ))]:-${RETRY_BACKOFF[-1]}}"
+      echo "${AMARILLO}[*]${RESET} nmap falló (intento $attempt/$total_attempts). Reintentando en ${backoff}s..."
+      log "RETRY: nmap intento $attempt falló, backoff ${backoff}s"
+      sleep "$backoff"
+    fi
+    attempt=$(( attempt + 1 ))
+  done
+
+  echo "${ROJO}[ERROR]${RESET} nmap falló tras $total_attempts intentos" >&2
+  log "ERROR: nmap falló tras $total_attempts intentos"
+  return 1
+}
+
 # ── Función: escanear y generar inventario ──────────────────────────────────
 escanear() {
   local xml_tmp
   xml_tmp="$(mktemp /tmp/nmap_xml_XXXXXX)"
   local inicio=$(date +%s)
 
-  # -T4: rate limiting agresivo
-  # --max-rtt-timeout 3: timeout 3s por host (nmap 7.991 usa segundos)
-  local exit_code=0
-  nmap -T4 --max-rtt-timeout 3 -F --open -oX "$xml_tmp" "$RED" 2>/dev/null || exit_code=$?
+  nmap_retry "$xml_tmp" || { rm -f "$xml_tmp"; return 1; }
   local fin=$(date +%s)
   local duracion=$(( fin - inicio ))
-
-  if (( exit_code != 0 )) || [[ ! -s "$xml_tmp" ]]; then
-    echo "${ROJO}[ERROR]${RESET} nmap no produjo salida (¿sudo? ¿nmap instalado?)" >&2
-    log "ERROR: nmap falló (exit=$exit_code)"
-    rm -f "$xml_tmp"
-    return 1
-  fi
 
   # Validar que es XML válido
   if ! head -c 100 "$xml_tmp" | grep -q '<nmaprun\|<?xml'; then
@@ -159,7 +220,6 @@ for host_el in root.iter('host'):
     hostname_el = host_el.find('hostnames/hostname')
     nombre = hostname_el.text if hostname_el is not None and hostname_el.text else 'sin_nombre'
 
-    # MAC address
     mac_el = host_el.find('address[@addrtype="mac"]')
     mac = mac_el.get('addr', '') if mac_el is not None else ''
 
@@ -191,7 +251,6 @@ PYEOF
 )" || { rm -f "$xml_tmp"; return 1; }
   rm -f "$xml_tmp"
 
-  # Guardar inventario con fecha
   local fecha
   fecha="$(date +%Y%m%d_%H%M%S)"
   local archivo
@@ -213,7 +272,6 @@ generar_cambios() {
   local archivo_actual="$1"
   local previos
   previos="$(ls -t "$DIR_INV"/inv_*.json 2>/dev/null || true)"
-  # Excluir el actual
   local previos_excl=()
   local p
   while IFS= read -r p; do
@@ -246,11 +304,10 @@ generar_cambios() {
         puertos_cerrados: ($pv - $pn)
       }')"
 
-  # Detección de IPs no autorizadas (soporta IPs sueltas y rangos CIDR)
+  # Detección de IPs no autorizadas
   local no_autorizadas
   no_autorizadas="$(python3 - "$archivo_actual" "$AUTH_FILE" <<'PYEOF'
 import sys, json, ipaddress
-from datetime import datetime, timezone
 
 inv_path, auth_path = sys.argv[1], sys.argv[2]
 with open(inv_path) as f:
@@ -261,7 +318,6 @@ try:
 except:
     auth = []
 
-# Construir lista de IPs autorizadas (soltas + CIDR expandidos)
 auth_ips = set()
 for entry in auth:
     if isinstance(entry, dict):
@@ -276,7 +332,6 @@ for entry in auth:
                 net = ipaddress.ip_network(entry['cidr'], strict=False)
                 for ip in net.hosts():
                     auth_ips.add(str(ip))
-                # Incluir network y broadcast también
                 auth_ips.add(str(net.network_address))
                 auth_ips.add(str(net.broadcast_address))
             except ValueError:
@@ -356,14 +411,24 @@ PYEOF
   return 0
 }
 
-# ── Función: sincronizar (GET /sync) ──────────────────────────────────────────
+# ── Función: sincronizar (GET /sync) con backoff ─────────────────────────────
 sincronizar() {
+  [[ "$SYNC_ACTIVADO" == true ]] || return 0
+
   local sync_data
-  sync_data="$(curl -s -f "$SYNC_URL" 2>/dev/null)" || {
-    echo "${AMARILLO}[WARN]${RESET} No se pudo sincronizar con $SYNC_URL" >&2
-    log "WARN: sync falló"
+  sync_data="$(curl -s -f --max-time 10 "$SYNC_URL" 2>/dev/null)" || {
+    SYNC_FALLOS=$((SYNC_FALLOS + 1))
+    log "WARN: sync falló ($SYNC_FALLOS/$SYNC_MAX_FALLOS)"
+    if (( SYNC_FALLOS >= SYNC_MAX_FALLOS )); then
+      echo "${AMARILLO}[WARN]${RESET} /sync falló ${SYNC_MAX_FALLOS} veces. Desactivado hasta próximo reinicio." >&2
+      SYNC_ACTIVADO=false
+      log "SYNC: desactivado tras ${SYNC_MAX_FALLOS} fallos"
+    fi
     return 1
   }
+
+  SYNC_FALLOS=0
+
   echo "$sync_data" | jq -e '.autorizados' >/dev/null 2>&1 && {
     echo "$sync_data" | jq '.autorizados' > "$AUTH_FILE"
     echo "${VERDE}[*]${RESET} autorizados.json actualizado desde /sync"
@@ -376,16 +441,41 @@ sincronizar() {
   }
 }
 
+# ── Función: health check del webhook ────────────────────────────────────────
+comprobar_webhook() {
+  [[ "$WEBHOOK_ACTIVADO" == true ]] || return 0
+  local code
+  code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "$WEBHOOK" 2>/dev/null)" || code="000"
+  if [[ "$code" == "000" || "$code" == "404" || "$code" == "503" ]]; then
+    WEBHOOK_FALLOS=$((WEBHOOK_FALLOS + 1))
+    log "WEBHOOK: health check fallo ($code) - $WEBHOOK_FALLOS/$WEBHOOK_MAX_FALLOS"
+    if (( WEBHOOK_FALLOS >= WEBHOOK_MAX_FALLOS )); then
+      echo "${AMARILLO}[WARN]${RESET} Webhook caído ${WEBHOOK_MAX_FALLOS} veces. Desactivado hasta próximo reinicio." >&2
+      WEBHOOK_ACTIVADO=false
+      log "WEBHOOK: desactivado tras ${WEBHOOK_MAX_FALLOS} fallos"
+    fi
+  else
+    WEBHOOK_FALLOS=0
+  fi
+}
+
 # ── Función: enviar webhook (POST) ───────────────────────────────────────────
 enviar_webhook() {
   local payload="$1"
+  [[ "$WEBHOOK_ACTIVADO" == true ]] || {
+    echo "${AMARILLO}[SKIP]${RESET} Webhook desactivado (fallo previo), no se envía." >&2
+    log "WEBHOOK: omitido (desactivado)"
+    return 1
+  }
+
   local resp
-  resp="$(curl -s -o /dev/null -w '%{http_code}' \
+  resp="$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 \
     -X POST \
     -H 'Content-Type: application/json' \
     -d "$payload" \
-    "$WEBHOOK")"
-  if [[ "$resp" == "200" ]]; then
+    "$WEBHOOK" 2>/dev/null)" || resp="000"
+
+  if [[ "$resp" == "200" || "$resp" == "201" || "$resp" == "202" ]]; then
     echo "${VERDE}[WEBHOOK]${RESET} HTTP $resp → $WEBHOOK"
     log "WEBHOOK: enviado ($resp)"
   else
@@ -423,17 +513,19 @@ generar_informe() {
 # ── Ejecución principal ──────────────────────────────────────────────────────
 echo "${NEGRITA}═══ Inventario de red · $(date -u) ═══${RESET}"
 echo "Red: $RED · Escáner: $ESCANER · Webhook: $WEBHOOK"
-echo "Log: $LOG_FILE"
+echo "Log: $LOG_FILE · Puertos: $PUERTOS_SCAN · Retry: $RETRY_NMAP"
 if [[ "$SOLO_INV" == true ]]; then
   echo "${AZUL}[*] Modo: solo inventario${RESET}"
 else
-  echo "${AZUL}[*] Modo vigilancia: cada ${VIGILANCIA}s. Ctrl+C para salir.${RESET}"
+  echo "${AZUL}[*] Modo vigilancia: cada ${VIGILANCIA}s (${VIGILANCIA/60} min). Ctrl+C para salir.${RESET}"
 fi
 echo
-log "INICIO: red=$RED escaner=$ESCANER solo_inv=$SOLO_INV"
+log "INICIO: red=$RED escaner=$ESCANER solo_inv=$SOLO_INV puertos=$PUERTOS_SCAN"
 
 ciclo() {
+  comprobar_webhook || true
   sincronizar || true
+
   local exito=0
   escanear || exito=1
   if (( exito )); then
@@ -441,9 +533,10 @@ ciclo() {
     return 1
   fi
 
-  # Buscar el inventario actual
   local archivo_actual
   archivo_actual="$(ls -t "$DIR_INV"/inv_*.json | head -1)"
+
+  find "$DIR_INV" -name 'inv_*.json' -mtime +30 -delete 2>/dev/null || true
 
   if [[ "$SOLO_INV" == true ]]; then
     echo "$INVENTARIO_JSON" | jq .
@@ -462,33 +555,27 @@ ciclo() {
   else
     echo "${NEGRITA}${AMARILLO}[*] Cambios detectados:${RESET}"
 
-    # Imprimir con colores
     echo "$CAMBIOS_JSON" | jq -r '
-      def color(n): if n > 0 then "nuevos" else "" end;
       if .nuevos | length > 0 then
-        "  \(.nuevos | length) hosts NUEVOS:"
-        + " " + ([.nuevos[] | " " + .] | join(" · "))
+        "  \(.nuevos | length) hosts NUEVOS: " + ([.nuevos[] | " " + .] | join(" · "))
       else "" end
     ' 2>/dev/null || true
 
     echo "$CAMBIOS_JSON" | jq -r '
       if .desaparecidos | length > 0 then
-        "  " + (.desaparecidos | length | tostring) + " hosts DESAPARECIDOS:"
-        + " " + ([.desaparecidos[] | " " + .] | join(" · "))
+        "  " + (.desaparecidos | length | tostring) + " hosts DESAPARECIDOS: " + ([.desaparecidos[] | " " + .] | join(" · "))
       else "" end
     ' 2>/dev/null || true
 
     echo "$CAMBIOS_JSON" | jq -r '
       if .puertos_abiertos | length > 0 then
-        "  " + (.puertos_abiertos | length | tostring) + " puertos ABIERTOS:"
-        + " " + ([.puertos_abiertos[] | " " + .ip + ":" + (.puerto | tostring)] | join(" · "))
+        "  " + (.puertos_abiertos | length | tostring) + " puertos ABIERTOS: " + ([.puertos_abiertos[] | " " + .ip + ":" + (.puerto | tostring)] | join(" · "))
       else "" end
     ' 2>/dev/null || true
 
     echo "$CAMBIOS_JSON" | jq -r '
       if .puertos_cerrados | length > 0 then
-        "  " + (.puertos_cerrados | length | tostring) + " puertos CERRADOS:"
-        + " " + ([.puertos_cerrados[] | " " + .ip + ":" + (.puerto | tostring)] | join(" · "))
+        "  " + (.puertos_cerrados | length | tostring) + " puertos CERRADOS: " + ([.puertos_cerrados[] | " " + .ip + ":" + (.puerto | tostring)] | join(" · "))
       else "" end
     ' 2>/dev/null || true
 
